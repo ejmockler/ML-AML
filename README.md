@@ -1,4 +1,4 @@
-# ML-AML: Acute Myeloid Leukemia Perturbation Analysis Pipeline
+# ML-AML: Acute Myeloid Leukemia Perturbation Analysis
 
 ## Overview
 
@@ -15,56 +15,56 @@ The project follows a sequential workflow:
 
 ```mermaid
 flowchart TD
-    A[Data Ingestion\nGEO Dataset] --> B[Preprocessing\nBatch Correction]
-    B --> C[Feature Selection\nBayesian Model]
-    C --> D[GEARS Model\nIntegration]
-    D --> E1[AML-to-Healthy\nPerturbation Analysis]
-    D --> E2[Healthy-to-AML\nPerturbation Analysis]
-    E1 --> F1[Therapeutic\nTarget Identification]
-    E2 --> F2[Cancer Driver\nGene Identification]
+    A["Data Ingestion<br/>GEO Dataset"] --> B["Preprocessing<br/>Batch Correction"]
+    B --> C["Feature Selection<br/>Bayesian Model"]
+    C --> D["GEARS Model<br/>Integration"]
+    D --> E1["AML-to-Healthy<br/>Perturbation Analysis"]
+    D --> E2["Healthy-to-AML<br/>Perturbation Analysis"]
+    E1 --> F1["Therapeutic<br/>Target Identification"]
+    E2 --> F2["Cancer Driver<br/>Gene Identification"]
     
-    style A fill:#f9d5e5,stroke:#333,stroke-width:2px
-    style B fill:#eeeeee,stroke:#333,stroke-width:2px
-    style C fill:#dcf2f1,stroke:#333,stroke-width:2px
-    style D fill:#f5ebe0,stroke:#333,stroke-width:2px
-    style E1 fill:#e3d5ca,stroke:#333,stroke-width:2px
-    style E2 fill:#d5bdaf,stroke:#333,stroke-width:2px
-    style F1 fill:#d5bdaf,stroke:#333,stroke-width:2px
-    style F2 fill:#e3d5ca,stroke:#333,stroke-width:2px
+    style A fill:#b3e0ff,stroke:#333,stroke-width:2px,color:#000
+    style B fill:#d4f1f9,stroke:#333,stroke-width:2px,color:#000
+    style C fill:#e6f9ff,stroke:#333,stroke-width:2px,color:#000
+    style D fill:#ffffff,stroke:#333,stroke-width:2px,color:#000
+    style E1 fill:#c2f0c2,stroke:#333,stroke-width:2px,color:#000
+    style E2 fill:#ffcccc,stroke:#333,stroke-width:2px,color:#000
+    style F1 fill:#c2f0c2,stroke:#333,stroke-width:2px,color:#000
+    style F2 fill:#ffcccc,stroke:#333,stroke-width:2px,color:#000
 ```
 
 ### Detailed Process Flow
 
 ```mermaid
 flowchart LR
-    subgraph DataPrep[Data Preparation]
-        A1[GEO\nSingle-Cell Data] --> A2[Data Loading\n& QC]
-        A2 --> A3[Normalization\n& Integration]
+    subgraph DataPrep["Data Preparation"]
+        A1["GEO<br/>Single-Cell Data"] --> A2["Data Loading<br/>& QC"]
+        A2 --> A3["Normalization<br/>& Integration"]
     end
     
-    subgraph Analysis[Feature Analysis]
-        B1[Bayesian\nFeature Selection] --> B2[Upregulated\nGene Identification]
-        B2 --> B3[Perturbation\nTarget Selection]
+    subgraph Analysis["Feature Analysis"]
+        B1["Bayesian<br/>Feature Selection"] --> B2["Upregulated<br/>Gene Identification"]
+        B2 --> B3["Perturbation<br/>Target Selection"]
     end
     
-    subgraph Prediction[Perturbation Prediction]
-        C1[GEARS Model\nLoading] --> C2[Expression\nPrediction]
-        C2 --> C3[Predicted\nCell States]
+    subgraph Prediction["Perturbation Prediction"]
+        C1["GEARS Model<br/>Loading"] --> C2["Expression<br/>Prediction"]
+        C2 --> C3["Predicted<br/>Cell States"]
     end
     
-    subgraph Evaluation[Result Evaluation]
-        D1[Classification\nScores] --> D2[Distribution\nComparison]
-        D2 --> D3[Therapeutic & Driver\nCandidates]
+    subgraph Evaluation["Result Evaluation"]
+        D1["Classification<br/>Scores"] --> D2["Distribution<br/>Comparison"]
+        D2 --> D3["Therapeutic & Driver<br/>Candidates"]
     end
     
     DataPrep --> Analysis
     Analysis --> Prediction
     Prediction --> Evaluation
     
-    style DataPrep fill:#f9f9f9,stroke:#333,stroke-width:1px
-    style Analysis fill:#f0f0f0,stroke:#333,stroke-width:1px
-    style Prediction fill:#e8e8e8,stroke:#333,stroke-width:1px
-    style Evaluation fill:#e0e0e0,stroke:#333,stroke-width:1px
+    style DataPrep fill:#cce6ff,stroke:#333,stroke-width:1px,color:#000
+    style Analysis fill:#e6f2ff,stroke:#333,stroke-width:1px,color:#000
+    style Prediction fill:#e6ffff,stroke:#333,stroke-width:1px,color:#000
+    style Evaluation fill:#ccf2ff,stroke:#333,stroke-width:1px,color:#000
 ```
 
 ## Key Components
@@ -174,18 +174,24 @@ The `ml-aml.ipynb` notebook serves as the primary entry point and contains step-
 
 ```mermaid
 flowchart TD
-    A[Raw scRNA-seq Data] --> B[Normalized AnnData]
-    B --> C[Integrated Multi-sample Dataset]
-    C --> D[Feature Selection]
-    D --> E[Perturbation Conditions]
-    E --> F1[AML-to-Healthy\nGEARS Prediction]
-    E --> F2[Healthy-to-AML\nGEARS Prediction]
-    F1 --> G1[Therapeutic Targets]
-    F2 --> G2[Cancer Driver Genes]
+    A["Raw scRNA-seq Data"] --> B["Normalized AnnData"]
+    B --> C["Integrated Multi-sample Dataset"]
+    C --> D["Feature Selection"]
+    D --> E["Perturbation Conditions"]
+    E --> F1["AML-to-Healthy<br/>GEARS Prediction"]
+    E --> F2["Healthy-to-AML<br/>GEARS Prediction"]
+    F1 --> G1["Therapeutic Targets"]
+    F2 --> G2["Cancer Driver Genes"]
     
-    style A fill:#f9f9f9,stroke:#333,stroke-width:1px
-    style G1 fill:#e0e0e0,stroke:#333,stroke-width:1px
-    style G2 fill:#e0e0e0,stroke:#333,stroke-width:1px
+    style A fill:#cce6ff,stroke:#333,stroke-width:1px,color:#000
+    style B fill:#d4f1f9,stroke:#333,stroke-width:1px,color:#000
+    style C fill:#e6f9ff,stroke:#333,stroke-width:1px,color:#000
+    style D fill:#ffffff,stroke:#333,stroke-width:1px,color:#000
+    style E fill:#f2f2f2,stroke:#333,stroke-width:1px,color:#000
+    style F1 fill:#c2f0c2,stroke:#333,stroke-width:1px,color:#000
+    style F2 fill:#ffcccc,stroke:#333,stroke-width:1px,color:#000
+    style G1 fill:#c2f0c2,stroke:#333,stroke-width:1px,color:#000
+    style G2 fill:#ffcccc,stroke:#333,stroke-width:1px,color:#000
 ```
 
 1. **Raw Data → Processed AnnData**:
