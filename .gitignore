@@ -1,0 +1,15 @@
+__pycache__/
+venv/
+GEARS_data/
+scrna_data/
+wandb/
+
+checkpoint*.params
+*.pkl
+*.gz
+*.zip
+*.csv
+*.h5
+*.h5ad
+
+.DS_Store
