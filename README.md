@@ -76,14 +76,18 @@ flowchart LR
 
 ### 2. Preprocessing
 - Normalizes gene expression data
-- Performs batch correction across samples
+- Performs batch correction (e.g., using Harmony on the PCA embedding) across samples to mitigate technical variation for visualization and clustering.
 - Creates integrated AnnData objects
 - Applies quality control filters
 
 ### 3. Feature Selection
-- Uses `BayesianFeatureSelector` to identify differentially expressed genes
+- Uses `BayesianFeatureSelector` on the normalized, log-transformed gene expression matrix (`adata.X` or `adata.raw.X`) to identify differentially expressed genes between conditions (e.g., malignant vs. normal).
+- **Prior Specification:** The model employs a hierarchical Bayesian approach. Specifically, it uses a **shrinkage prior (Horseshoe-like)** on the gene coefficients (`beta`). This involves:
+    - A global scale parameter (`tau_0` ~ HalfCauchy) influencing overall sparsity.
+    - Local, feature-specific scale parameters (`lam` ~ HalfCauchy, `c2` ~ InverseGamma) allowing important features to have larger coefficients while strongly shrinking noise features towards zero.
+    - This prior structure helps adaptively identify relevant genes from high-dimensional expression data.
 - Focuses on genes upregulated in malignant cells
-- Employs probabilistic programming for robust feature importance
+- Employs probabilistic programming (Pyro) for robust feature importance estimation based on the posterior distribution of coefficients.
 
 ### 4. GEARS Model Integration
 - Utilizes pre-trained GEARS model for perturbation prediction
