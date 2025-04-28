@@ -163,7 +163,7 @@ class PertData:
             elif data_name == 'replogle_rpe1_essential':
                 ## Note: This is not the complete dataset and has been filtered
                 url = 'https://dataverse.harvard.edu/api/access/datafile/7458694'
-            data_path = os.path.join(self.data_path, data_name)
+            data_path = os.path.join(self.data_path, )
             zip_data_download_wrapper(url, data_path, self.data_path)
             self.dataset_name = data_path.split('/')[-1]
             self.dataset_path = data_path

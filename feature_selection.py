@@ -13,7 +13,7 @@ import pyro
 import pyro.distributions as dist
 from pyro.infer import SVI, Trace_ELBO, Predictive
 from pyro.optim import ClippedAdam
-from pyro.infer.autoguide import AutoNormal
+from pyro.infer.autoguide import AutoDiagonalNormal
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.metrics import f1_score, accuracy_score
 from sklearn.preprocessing import MinMaxScaler
@@ -24,6 +24,26 @@ import torch
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression # Keep this for validation metrics
+from sklearn.metrics import precision_recall_fscore_support
+from scipy.special import expit # Sigmoid function
+from scipy.stats import beta
+
+# Conditional MLflow import
+try:
+    import mlflow
+    MLFLOW_AVAILABLE = True
+except ImportError:
+    MLFLOW_AVAILABLE = False
+    # Define dummy mlflow object if mlflow is not available
+    class DummyMlflow:
+        def __getattr__(self, name):
+            def dummy_method(*args, **kwargs):
+                # warnings.warn(f"MLflow not installed. Call to mlflow.{name} ignored.")
+                pass # Silently ignore if mlflow is not installed
+            return dummy_method
+    mlflow = DummyMlflow()
 
 @dataclass
 class FeatureSelectionResult:
@@ -76,6 +96,10 @@ class BayesianFeatureSelector(BaseEstimator, TransformerMixin):
         self.smooth_window = smooth_window
         self.base_cumulative_density_threshold = base_cumulative_density_threshold
         self.base_sensitivity = base_sensitivity
+        self._best_y_true = None
+        self._best_y_pred = None
+        self._best_y_proba = None
+        self.best_validation_sample_details_ = None
         
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -90,7 +114,6 @@ class BayesianFeatureSelector(BaseEstimator, TransformerMixin):
 
     def _log_to_mlflow(self, metrics=None, params=None, artifacts=None):
         """Helper method to handle MLflow logging with graceful fallback"""
-        import mlflow
         if not self.use_mlflow:
             return
 
@@ -113,24 +136,31 @@ class BayesianFeatureSelector(BaseEstimator, TransformerMixin):
         self.scaler.fit(X.values if isinstance(X, pd.DataFrame) else X)
         
         # Shuffle input data while maintaining index alignment
-        rng = np.random.RandomState(int(self.unique_id))
+        # Extract the timestamp part of unique_id for seeding
+        try:
+            timestamp_str = self.unique_id.split('_')[-1]
+            seed = int(timestamp_str)
+        except (IndexError, ValueError):
+            # Fallback if unique_id format is unexpected
+            warnings.warn(f"Warning: Could not parse timestamp from unique_id '{self.unique_id}'. Using current time for seeding.")
+            seed = int(time.time())
+        rng = np.random.RandomState(seed)
         shuffle_idx = rng.permutation(len(X))
+        # Ensure X and y are numpy arrays before fancy indexing if they aren't already
+        X_np = X.values if isinstance(X, pd.DataFrame) else X
+        y_np = y.values if isinstance(y, pd.Series) else y
         
-        if isinstance(X, pd.DataFrame):
-            X = X.iloc[shuffle_idx]
-            y = y.iloc[shuffle_idx]
-        else:
-            X = X[shuffle_idx]
-            y = y[shuffle_idx]
+        X_shuffled = X.iloc[shuffle_idx].reset_index(drop=True)
+        y_shuffled = y.iloc[shuffle_idx].reset_index(drop=True)
         
         # Convert to tensors
         X_tensor = torch.tensor(
-            self.scaler.transform(X.values) if isinstance(X, pd.DataFrame) else self.scaler.transform(X),
+            self.scaler.transform(X_shuffled) if isinstance(X, pd.DataFrame) else self.scaler.transform(X_np),
             dtype=torch.float64,
             device=self.device
         )
         y_tensor = torch.tensor(
-            y.values if hasattr(y, 'values') else y,
+            y_shuffled,
             dtype=torch.float64,
             device=self.device
         )
@@ -170,154 +200,196 @@ class BayesianFeatureSelector(BaseEstimator, TransformerMixin):
             shuffle=False
         )
         
-        # Initialize validation_results_ with numpy arrays instead of lists
-        # Approach 1: Store predictions as a 2D array (samples × draws)
-        sample_ids = y.index.values if hasattr(y, 'index') else None
-        if sample_ids is not None:
-            val_sample_ids = sample_ids[split_idx:]
-            self.validation_results_ = pd.DataFrame(index=val_sample_ids)
-            self.validation_results_['label'] = y_val.cpu().numpy()
-            self.validation_results_['sum_correct'] = 0
-            self.validation_results_['count'] = 0
-            # Initialize predictions array
-            self.val_predictions_ = np.zeros((len(val_sample_ids), self.num_draws), dtype=np.int8)
-            self.current_draw_ = 0
+        # --- Pyro Setup ---
+        pyro.clear_param_store() # Ensure fresh start for parameters
+        num_features = X_train.shape[1]
 
-        def model(X, y=None):
-            D = X.size(1)
-            
-            tau_0 = pyro.sample('tau_0', dist.HalfCauchy(scale=1.0))
-            tau_0 = tau_0.to(self.device)
-            
-            lam = pyro.sample('lam', dist.HalfCauchy(scale=1.0).expand([D]).to_event(1))
-            lam = lam.to(self.device)
-            
-            c2 = pyro.sample('c2', dist.InverseGamma(concentration=1.0, rate=1.0).expand([D]).to_event(1))
-            c2 = c2.to(self.device)
-            
+        def pyro_model(X, y=None): # Changed signature back, removed unused args
+            num_features = X.size(1) # Get num_features from input
+
+            # --- Horseshoe Prior Definition ---
+            tau_0 = pyro.sample('tau_0', dist.HalfCauchy(scale=torch.tensor(1.0, device=self.device, dtype=torch.float64))) # Ensure scale is tensor on device
+
+            lam = pyro.sample('lam', dist.HalfCauchy(scale=torch.ones(num_features, device=self.device, dtype=torch.float64)).to_event(1)) # Use ones vector for scale
+
+            c2 = pyro.sample('c2', dist.InverseGamma(concentration=torch.ones(num_features, device=self.device, dtype=torch.float64), # Use ones vector
+                                                    rate=torch.ones(num_features, device=self.device, dtype=torch.float64)).to_event(1)) # Use ones vector
+
+            # Ensure calculations are done with tensors on the correct device
             sigma = tau_0 * lam * torch.sqrt(c2)
-            
+
             beta = pyro.sample(
                 'beta',
-                dist.Normal(torch.zeros(D, dtype=torch.float64, device=self.device), sigma).to_event(1)
+                dist.Normal(torch.zeros(num_features, dtype=torch.float64, device=self.device), sigma).to_event(1)
             )
-            intercept = pyro.sample('intercept', dist.Normal(0., 10.))
-            logits = intercept + X @ beta
+            intercept = pyro.sample('intercept', dist.Normal(torch.tensor(0., device=self.device, dtype=torch.float64),
+                                                              torch.tensor(10., device=self.device, dtype=torch.float64))) # Back to 10.0 scale, ensure tensors
+            # --- End Horseshoe Prior Definition ---
+
+            logits = intercept + X @ beta # Matrix multiplication for logits
 
             with pyro.plate('data', X.size(0)):
                 pyro.sample('obs', dist.Bernoulli(logits=logits), obs=y)
 
-        guide = AutoNormal(model)
 
-        optimizer = ClippedAdam({"lr": self.lr, "clip_norm": 1.0})
-        svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
-        
-        best_val_loss = float("inf")
+        guide = AutoDiagonalNormal(pyro_model)
+
+        # --- SVI Training Loop ---
+        optimizer = ClippedAdam({"lr": self.lr, "clip_norm": 10.0}) # Pyro optimizer
+        svi = SVI(pyro_model, guide, optimizer, loss=Trace_ELBO())
+
+        # Initialize storage for validation results
+        self.validation_results_ = [] # Store metrics from validation steps
+
+        best_val_loss = float('inf')
         patience_counter = 0
 
-        def compute_proba(current_params, X):
-            beta = current_params['AutoNormal.locs.beta']
-            intercept = current_params['AutoNormal.locs.intercept']
-            logits = intercept + torch.matmul(X, beta)
-            proba = torch.sigmoid(logits)
-            return proba.detach().cpu().numpy()
+        # Start MLflow run if enabled
+        if self.use_mlflow and MLFLOW_AVAILABLE:
+            mlflow.start_run(run_name=f"BFS_{self.unique_id}")
+            # Log hyperparameters
+            params_to_log = {k: v for k, v in self.__dict__.items() if isinstance(v, (int, float, str, bool)) and k != 'unique_id' and k!= 'logger'} # Exclude logger
+            mlflow.log_params(params_to_log)
 
-        if self.verbose:
-            pbar = tqdm(
-                range(1, self.num_iterations + 1),
-                desc="Training",
-                unit="iter",
-                ncols=150  # Wider to accommodate more text
-            )
-        else:
-            pbar = range(1, self.num_iterations + 1)
+        start_time = time.time()
 
-        for epoch in pbar:
+        for iter_num in tqdm(range(self.num_iterations), desc="SVI Iterations", disable=not self.verbose):
             epoch_loss = 0.0
-            for X_batch, y_batch in train_loader:
-                loss = svi.step(X_batch, y_batch)
-                epoch_loss += loss
+            num_batches = 0
+            for X_batch, y_batch in train_loader: # Use DataLoader for batching
+                 # Ensure batches are on the correct device and dtype
+                 X_batch = X_batch.to(device=self.device, dtype=torch.float64)
+                 y_batch = y_batch.to(device=self.device, dtype=torch.float64)
 
-            avg_epoch_loss = epoch_loss / len(train_loader.dataset)
+                 # Pass necessary args to model and guide
+                 loss = svi.step(X_batch, y_batch) # Removed reg_lambda and sensitivity args
+                 epoch_loss += loss
+                 num_batches += 1
 
-            val_loss = 0.0
-            for X_val_batch, y_val_batch in val_loader:
-                val_loss += svi.evaluate_loss(X_val_batch, y_val_batch)
-            avg_val_loss = val_loss / len(val_loader.dataset)
-            
-            current_params = {k: v.clone().detach() for k, v in pyro.get_param_store().items()}
-            y_val_pred_prob = compute_proba(current_params, X_val)
-            y_val_pred = (y_val_pred_prob >= 0.5).astype(int)
-            
-            accuracy = accuracy_score(y_val.cpu().numpy(), y_val_pred)
-            f1 = f1_score(y_val.cpu().numpy(), y_val_pred)
-            
-            if self.use_mlflow:
-                self.log_metrics(epoch, avg_epoch_loss, avg_val_loss, accuracy, f1)
+            epoch_loss /= (len(train_loader.dataset) if len(train_loader.dataset) > 0 else 1) # Normalize loss by dataset size
 
-            if self.validation_results_ is not None:
-                correct = (y_val_pred == y_val.cpu().numpy()).astype(int)
-                self.validation_results_.loc[val_sample_ids, 'sum_correct'] += correct
-                self.validation_results_.loc[val_sample_ids, 'count'] += 1
-                # Store predictions in the array
-                if self.current_draw_ < self.num_draws:
-                    self.val_predictions_[:, self.current_draw_] = y_val_pred
-                    self.current_draw_ += 1
 
-            if self.verbose:
-                status = {
-                    'train_loss': f'{avg_epoch_loss:.4f}',
-                    'val_loss': f'{avg_val_loss:.4f}',
-                    'acc': f'{accuracy:.4f}',
-                    'f1': f'{f1:.4f}'
-                }
-                
-                if avg_val_loss < best_val_loss:
-                    status['checkpoint'] = '✓'  # Checkmark symbol
-                
-                pbar.set_postfix(status)
+            # --- Validation and Logging ---
+            # Perform validation periodically
+            # verbose_freq needs to be defined in __init__, e.g., self.verbose_freq = 10
+            if not hasattr(self, 'verbose_freq'): self.verbose_freq = 10 # Default if not set
+            if (iter_num + 1) % self.verbose_freq == 0 or iter_num == self.num_iterations - 1:
+                 # Use Predictive to get samples from the posterior predictive distribution
+                 # Only request 'obs' site, as '_RETURN' is None for this model
+                 predictive = Predictive(pyro_model, guide=guide, num_samples=100, return_sites=("obs",)) # Get 100 posterior samples for 'obs' # Pass restored model name
 
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                patience_counter = 0
-                pyro.get_param_store().save(self.checkpoint_path)
-            else:
-                patience_counter += 1
-                if patience_counter >= self.patience:
-                    if self.verbose:
-                        print("Early stopping triggered.")
-                    break
+                 with torch.no_grad():
+                      # Pass the existing validation tensor X_val
+                      posterior_samples = predictive(X_val) # Removed reg_lambda and sensitivity args
+                      # posterior_samples['obs'] shape: (num_samples, num_data)
+                      # Average probabilities over samples
+                      # Use the posterior samples from predictive which are based on logits
+                      # Note: posterior_samples['obs'] might contain sampled outcomes (0/1) or logits depending on Pyro version/model.
+                      # Assuming it gives logits or something transformable to probability:
+                      # If posterior_samples['obs'] are logits:
+                      # y_pred_proba_val = torch.sigmoid(posterior_samples['_RETURN']).mean(0).cpu().numpy() # Often _RETURN contains logits/params
+                      # If posterior_samples['obs'] are sampled 0/1s:
+                      y_pred_proba_val = posterior_samples['obs'].float().mean(0).cpu().numpy() # Average samples to get proba
 
-        pyro.get_param_store().load(self.checkpoint_path)
+                      y_pred_val = (y_pred_proba_val > 0.5).astype(int)
+                      # Use the existing validation tensor y_val
+                      y_true_val = y_val.cpu().numpy() # Use original validation labels
 
-        predictive = Predictive(model, guide=guide, num_samples=self.num_samples, return_sites=['beta'])
-        posterior_samples = predictive(X_train, y_train)
-        beta_samples = posterior_samples['beta'].detach().cpu().numpy()
+                      # Calculate metrics using sklearn
+                      accuracy = accuracy_score(y_true_val, y_pred_val)
+                      precision, recall, f1, _ = precision_recall_fscore_support(
+                           y_true_val, y_pred_val, average='binary', zero_division=0
+                      )
+                      # Calculate validation loss (e.g., average log loss)
+                      # Use logits directly if available, otherwise calculate from probabilities
+                      # We don't have direct logits here easily, let's use prediction probability
+                      # A simple proxy: negative log-likelihood (using mean probability)
+                      # This is not the ELBO loss, but a classification performance metric
+                      val_loss = -np.mean(y_true_val * np.log(y_pred_proba_val + 1e-9) + (1 - y_true_val) * np.log(1 - y_pred_proba_val + 1e-9))
 
+
+                 # Store metrics
+                 current_metrics = {
+                      'iteration': iter_num + 1,
+                      'train_loss (ELBO)': epoch_loss, # Note: This is ELBO loss
+                      'val_loss (NLL)': val_loss,      # Note: This is NLL/Cross-Entropy
+                      'val_accuracy': accuracy,
+                      'val_precision': precision,
+                      'val_recall': recall,
+                      'val_f1': f1
+                 }
+                 self.validation_results_.append(current_metrics)
+
+                 if self.verbose:
+                      print(f"Iter {iter_num+1}/{self.num_iterations} - ELBO Loss: {epoch_loss:.4f}, Val NLL: {val_loss:.4f}, Val Acc: {accuracy:.4f}, Val F1: {f1:.4f}")
+
+                 # Log metrics to MLflow if enabled
+                 if self.use_mlflow and MLFLOW_AVAILABLE:
+                      mlflow.log_metric("train_loss_elbo", epoch_loss, step=iter_num + 1)
+                      mlflow.log_metric("val_loss_nll", val_loss, step=iter_num + 1)
+                      mlflow.log_metric("val_accuracy", accuracy, step=iter_num + 1)
+                      mlflow.log_metric("val_precision", precision, step=iter_num + 1)
+                      mlflow.log_metric("val_recall", recall, step=iter_num + 1)
+                      mlflow.log_metric("val_f1", f1, step=iter_num + 1)
+
+                 # Early Stopping Check (based on validation NLL loss)
+                 if val_loss < best_val_loss:
+                      best_val_loss = val_loss
+                      patience_counter = 0
+                      # Store the sample-wise results for this best iteration
+                      self._best_y_true = y_true_val
+                      self._best_y_pred = y_pred_val
+                      self._best_y_proba = y_pred_proba_val
+                      # Save parameters using Pyro's param store
+                      pyro.get_param_store().save(self.checkpoint_path)
+                 else:
+                      patience_counter += 1
+                      if patience_counter >= self.patience:
+                           if self.verbose:
+                                print(f"Early stopping triggered at iteration {iter_num + 1}")
+                           if self.use_mlflow and MLFLOW_AVAILABLE:
+                                mlflow.set_tag("early_stopping", "True")
+                           break # Exit training loop
+
+
+        # --- Feature Selection Post-Training ---
+        # Load the best parameters found during training
+        try:
+            # pyro.get_param_store().load(self.checkpoint_path) # Original call causing UnpicklingError
+            with open(self.checkpoint_path, "rb") as f:
+                 # Explicitly set weights_only=False if needed by your Pyro/Torch version
+                 loaded_state = torch.load(f, map_location=self.device) # Removed weights_only=False for now, add back if needed
+            pyro.get_param_store().set_state(loaded_state)
+        except FileNotFoundError:
+             warnings.warn(f"Checkpoint file {self.checkpoint_path} not found. Using parameters from the last iteration.")
+        except Exception as e:
+             warnings.warn(f"Failed to load checkpoint {self.checkpoint_path}: {e}. Using parameters from the last iteration.")
+
+        # Create DataFrame with best sample-wise validation results if available
+        if self._best_y_true is not None:
+            self.best_validation_sample_details_ = pd.DataFrame({
+                'true_label': self._best_y_true,
+                'predicted_label': self._best_y_pred,
+                'predicted_probability': self._best_y_proba,
+                'is_correct': (self._best_y_true == self._best_y_pred)
+            })
+            # Clean up temporary storage
+            del self._best_y_true, self._best_y_pred, self._best_y_proba
+        else:
+            warnings.warn("Could not create best_validation_sample_details_ as no best validation state was recorded.")
+
+        # Get posterior samples for beta coefficients using the final/best guide
+        predictive = Predictive(pyro_model, guide=guide, num_samples=self.num_samples, return_sites=['beta']) # Pass restored model name
+        # Need to pass dummy data that matches expected input shape for Predictive
+        X_dummy_for_predictive = torch.zeros((1, num_features), dtype=torch.float64, device=self.device) # Shape (1, num_features)
+        posterior_samples = predictive(X_dummy_for_predictive) # Removed reg_lambda and sensitivity args # Pass args model expects
+        beta_samples = posterior_samples['beta'].detach().cpu().numpy() # Shape: (num_samples, 1, num_features) or (num_samples, num_features)
+
+        # Squeeze dimensions if necessary, typical shape is (num_samples, num_features)
         if beta_samples.ndim == 3:
-            beta_samples = beta_samples.squeeze(1)
-        elif beta_samples.ndim == 2 and beta_samples.shape[1] == 1:
-            beta_samples = beta_samples.squeeze(1)
+            beta_samples = beta_samples.squeeze(1) # This might need adjustment based on Horseshoe output shape
 
-        # Aggregate per-sample metrics and log to MLflow
-        if self.validation_results_ is not None:
-            # Use only the draws we actually completed
-            actual_predictions = self.val_predictions_[:, :self.current_draw_]
-            
-            # Calculate metrics
-            self.validation_results_['accuracy'] = self.validation_results_['sum_correct'] / self.validation_results_['count']
-            self.validation_results_['accuracy_std'] = np.sqrt(
-                self.validation_results_['accuracy'] * (1 - self.validation_results_['accuracy']) / self.validation_results_['count']
-            )
-            self.validation_results_['draw_count'] = self.validation_results_['count']
-            
-            # Calculate average and std dev of predictions for each sample
-            self.validation_results_['avg_prediction'] = np.mean(actual_predictions, axis=1)
-            self.validation_results_['prediction_std'] = np.std(actual_predictions, axis=1)
-            
-            validation_results_table = self.validation_results_.reset_index(names='sample_id')
-            validation_results_table = validation_results_table[['sample_id', 'label', 'accuracy', 'accuracy_std', 'avg_prediction', 'prediction_std', 'draw_count']]
-
+        # --- Tail-based Feature Selection ---
         self.logger.info("Detecting data-driven threshold for feature selection.")
         try:
             # Compute posterior mean and standard deviation
@@ -328,9 +400,12 @@ class BayesianFeatureSelector(BaseEstimator, TransformerMixin):
             # Compute standardized effect sizes
             standardized_effect_sizes = np.abs(posterior_mean / posterior_std)
 
-            selected_features, threshold, fig = select_features_by_tail(
+            # Get feature names (handle DataFrame or numpy array)
+            feature_names = X.columns if isinstance(X, pd.DataFrame) else pd.Index([f'feature_{i}' for i in range(num_features)])
+
+            selected_feature_names, threshold, fig = select_features_by_tail(
                 standardized_effect_sizes,
-                feature_names=X.columns if isinstance(X, pd.DataFrame) else None,
+                feature_names=feature_names, # Pass the pd.Index
                 max_features=self.max_features,
                 k_neighbors=self.k_neighbors,
                 smooth_window=self.smooth_window,
@@ -338,71 +413,66 @@ class BayesianFeatureSelector(BaseEstimator, TransformerMixin):
                 base_sensitivity=self.base_sensitivity
             )
 
-            self.selected_credible_interval = threshold
-            self.selected_features_ = selected_features
+            self.selected_credible_interval = threshold # Store the threshold used
+            self.selected_features_ = selected_feature_names # Store as pd.Index
             self.tail_fig = fig
 
-             # Log validation results to MLflow  
-            if self.use_mlflow:
-                self._log_to_mlflow(
-                    metrics={
-                        'validation_loss': val_loss,
-                        'num_selected_features': len(selected_features),
-                        'feature_selection_threshold': threshold
-                    },
-                    params={
-                        'num_iterations': self.num_iterations,
-                        'learning_rate': self.lr,
-                        'batch_size': self.batch_size
-                    },
-                    artifacts={
-                        'validation_aggregated_results.json': validation_results_table
-                    }
-                )
-                
             # Log the figure to MLflow
-            if self.verbose and self.use_mlflow:
-                import mlflow
-                mlflow.log_figure(fig, f"standardized_effect_sizes_tail.png")
-                plt.close(fig)
+            if self.verbose and self.use_mlflow and MLFLOW_AVAILABLE:
+                mlflow.log_figure(fig, f"standardized_effect_sizes_tail_{self.unique_id}.png")
+                plt.close(fig) # Close the figure after logging
 
-            # Create and log feature statistics table
+            # --- Feature Statistics ---
             # Compute standardized effect sizes once
             beta_mean = np.mean(beta_samples, axis=0)
             beta_std = np.std(beta_samples, axis=0)
-            beta_std = np.where(beta_std == 0, np.finfo(float).eps, beta_std)
+            beta_std = np.where(beta_std == 0, np.finfo(float).eps, beta_std) # Avoid division by zero
+            effect_size = np.abs(beta_mean / beta_std)
+
+            # Create feature statistics DataFrame
             feature_stats = pd.DataFrame({
-                'feature_name': X.columns if isinstance(X, pd.DataFrame) else [f'feature_{i}' for i in range(len(beta_mean))],
+                'feature_name': feature_names, # Use the Index directly
                 'beta_mean': beta_mean,
                 'beta_std': beta_std,
-                'effect_size': standardized_effect_sizes,
-                'is_selected': [name in selected_features for name in (X.columns if isinstance(X, pd.DataFrame) else [f'feature_{i}' for i in range(len(beta_mean))])]
+                'effect_size': effect_size,
+                # Check membership using the Index
+                'is_selected': [name in self.selected_features_ for name in feature_names]
             })
-            
+
             # Sort by absolute effect size for better readability
             self.feature_stats = feature_stats.sort_values('effect_size', ascending=False)
-            
-            # Log to MLflow
-            self._log_to_mlflow(
-                metrics={
-                    'num_selected_features': len(selected_features),
-                    'feature_selection_threshold': threshold
-                },
-                params={
-                    'num_iterations': self.num_iterations,
-                    'learning_rate': self.lr,
-                    'batch_size': self.batch_size
-                },
-                artifacts={
-                    'feature_statistics.json': self.feature_stats
-                }
-            )
-                
+
+            # Log feature stats table to MLflow as artifact (e.g., CSV)
+            if self.use_mlflow and MLFLOW_AVAILABLE:
+                 stats_filename = f"feature_stats_{self.unique_id}.csv"
+                 self.feature_stats.to_csv(stats_filename, index=False)
+                 mlflow.log_artifact(stats_filename)
+                 # Clean up local file after logging
+                 os.remove(stats_filename)
+
+                 # Log final metrics
+                 mlflow.log_metric("final_num_selected_features", len(self.selected_features_))
+                 mlflow.log_metric("final_selection_threshold", self.selected_credible_interval)
+
+
         except Exception as e:
-            self.logger.error(f"Tail detection failed: {e}")
-            raise ValueError("Feature selection using the tail approach failed.")
-        finally:
-            pyro.clear_param_store()
+            self.logger.error(f"Tail detection or feature stats calculation failed: {e}", exc_info=True) # Log traceback
+            # Fallback or re-raise depending on desired behavior
+            # Maybe select top N features based on mean beta as a fallback?
+            # For now, let's store empty results and log the error
+            self.selected_features_ = pd.Index([])
+            self.feature_stats = pd.DataFrame()
+            self.selected_credible_interval = None
+            if self.use_mlflow and MLFLOW_AVAILABLE:
+                 mlflow.set_tag("error", f"Feature selection failed: {e}")
+
+
+        # Clean up Pyro param store
+        pyro.clear_param_store()
+
+        # End MLflow run if enabled and active
+        if self.use_mlflow and MLFLOW_AVAILABLE and mlflow.active_run():
+             mlflow.end_run()
 
         return self
 
@@ -416,32 +486,25 @@ class BayesianFeatureSelector(BaseEstimator, TransformerMixin):
 
     def log_metrics(self, epoch: int, train_loss: float, val_loss: float, accuracy: float, f1: float):
         """Log metrics with proper nesting under the feature selection run."""
-        import mlflow
-        # Get the current run context
-        current_run = mlflow.active_run()
-        if current_run is None:
-            self.logger.warning("No active MLflow run found for logging metrics")
-            return
-
-        # Log metrics directly without creating a new run
-        mlflow.log_metric("train_loss", train_loss, step=epoch)
-        mlflow.log_metric("val_loss", val_loss, step=epoch)
-        mlflow.log_metric("val_accuracy", accuracy, step=epoch)
-        mlflow.log_metric("val_f1_score", f1, step=epoch)
-        
-        if epoch == 1:
-            mlflow.log_params({
-                "unique_id": self.unique_id,
-                "covariance_type": self.covariance_type,
-                "num_iterations": self.num_iterations,
-                "learning_rate": self.lr,
-                "credible_interval": self.credible_interval,
-                "num_samples": self.num_samples,
-                "batch_size": self.batch_size,
-                "patience": self.patience,
-                "validation_split": self.validation_split,
-                "checkpoint_path": self.checkpoint_path
-            })
+        if self.use_mlflow:
+            mlflow.log_metric("train_loss", train_loss, step=epoch)
+            mlflow.log_metric("val_loss", val_loss, step=epoch)
+            mlflow.log_metric("val_accuracy", accuracy, step=epoch)
+            mlflow.log_metric("val_f1_score", f1, step=epoch)
+            
+            if epoch == 1:
+                mlflow.log_params({
+                    "unique_id": self.unique_id,
+                    "covariance_type": self.covariance_type,
+                    "num_iterations": self.num_iterations,
+                    "learning_rate": self.lr,
+                    "credible_interval": self.credible_interval,
+                    "num_samples": self.num_samples,
+                    "batch_size": self.batch_size,
+                    "patience": self.patience,
+                    "validation_split": self.validation_split,
+                    "checkpoint_path": self.checkpoint_path
+                })
 
     def predict_proba(self, X, use_all_features=True):
         """
@@ -472,8 +535,12 @@ class BayesianFeatureSelector(BaseEstimator, TransformerMixin):
         X_scaled = self.scaler.transform(X)
         X_tensor = torch.tensor(X_scaled, dtype=torch.float64, device=self.device)
         
-        # Load the best model parameters
-        pyro.get_param_store().load(self.checkpoint_path)
+        # Load the best model parameters manually
+        # pyro.get_param_store().load(self.checkpoint_path)
+        with open(self.checkpoint_path, "rb") as f:
+            # Explicitly set weights_only=False
+            loaded_state = torch.load(f, map_location=self.device, weights_only=False)
+        pyro.get_param_store().set_state(loaded_state)
         
         # Get the current parameters
         current_params = {k: v.clone().detach() for k, v in pyro.get_param_store().items()}

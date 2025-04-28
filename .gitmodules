@@ -1,0 +1,3 @@
+[submodule "CODEX"]
+	path = CODEX
+	url = https://github.com/sschrod/CODEX.git

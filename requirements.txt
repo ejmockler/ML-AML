@@ -3,10 +3,10 @@ pandas
 pyro-ppl
 scikit-learn
 scipy
-torch==2.5.1
+torch
 matplotlib
 mlflow
-tqdm 
+tqdm
 geoparse
 anndata==0.10.5
 torch_geometric
@@ -14,3 +14,6 @@ cell-gears==0.1.2
 plotly
 nbformat>=4.2.0
 wandb
+torch-scatter # For efficient batch aggregation in PyG
+scanpy
+harmonypy
