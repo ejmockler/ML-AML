@@ -31,6 +31,9 @@ def prepare_adata_for_gears(combined_adata, trained_genes, cache_file=None, max_
     """
     from data_processing.preprocessing import align_genes
     
+    # Initialize mapping to None
+    mapping = None
+    
     # Ensure max_workers is reasonable to avoid API rate limits
     if max_workers > 5:
         print(f"Warning: Reducing max_workers from {max_workers} to 5 to avoid Ensembl API rate limits")
@@ -52,8 +55,11 @@ def prepare_adata_for_gears(combined_adata, trained_genes, cache_file=None, max_
     if trained_has_ensembl and not combined_has_ensembl:
         print(f"Converting combined_adata gene symbols to Ensembl IDs using Ensembl REST API ({max_workers} threads)...")
         # Create a mapping between combined_adata var_names and trained_genes
-        mapping_genes = list(combined_adata.var_names) + trained_genes
+        mapping_genes = list(combined_adata.var_names) # Only map genes present in the input adata
         mapping = create_gene_id_mapping(mapping_genes, cache_file=cache_file, max_workers=max_workers, show_progress=show_progress)
+        
+        # Filter out None values from mapping before proceeding
+        mapping = {k: v for k, v in mapping.items() if v is not None}
         
         # Convert combined_adata var_names to Ensembl IDs
         combined_adata_ensembl = convert_adata_var_to_ensembl(combined_adata, mapping_dict=mapping, max_workers=max_workers, show_progress=show_progress)
@@ -77,7 +83,8 @@ def prepare_adata_for_gears(combined_adata, trained_genes, cache_file=None, max_
     else:
         print("Alignment failed.")
     
-    return gears_adata
+    # Return both the aligned data and the mapping used (if any)
+    return gears_adata, mapping
 
 # Example of how to use in the notebook:
 """
@@ -138,7 +145,7 @@ if combined_adata is not None:
                 print(f"  Key combined_adata.{key_type}['{key}'] not found, skipping deletion.")
     
     # Prepare the data with automatic gene ID conversion using multithreaded Ensembl API
-    gears_adata = prepare_adata_for_gears(combined_adata, trained_genes, 
+    gears_adata, mapping = prepare_adata_for_gears(combined_adata, trained_genes, 
                                           cache_file=cache_file,
                                           max_workers=max_workers,
                                           show_progress=show_progress)

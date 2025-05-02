@@ -5,6 +5,8 @@ from typing import Optional, Tuple, Union
 from dataclasses import dataclass
 from functools import lru_cache
 import warnings
+import joblib # Added
+import json   # Added
 
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 import numpy as np
@@ -13,7 +15,7 @@ import pyro
 import pyro.distributions as dist
 from pyro.infer import SVI, Trace_ELBO, Predictive
 from pyro.optim import ClippedAdam
-from pyro.infer.autoguide import AutoDiagonalNormal
+from pyro.infer.autoguide import AutoDiagonalNormal, AutoNormal
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.metrics import f1_score, accuracy_score
 from sklearn.preprocessing import MinMaxScaler
@@ -89,7 +91,9 @@ class BayesianFeatureSelector(BaseEstimator, TransformerMixin):
         self.validation_split = validation_split
         self.max_features = max_features
         self.min_threshold = min_threshold
-        self.checkpoint_path = f"{os.path.splitext(checkpoint_path)[0]}_{unique_id}.params"
+        self.base_checkpoint_dir = "bfs_checkpoints" # Base directory for saving
+        self.save_dir = os.path.join(self.base_checkpoint_dir, self.unique_id) # Directory for this specific run
+        os.makedirs(self.save_dir, exist_ok=True) # Create the directory
         self.num_draws = num_iterations  # Total number of validation predictions we'll store
         self.use_mlflow = use_mlflow
         self.k_neighbors = k_neighbors
@@ -112,6 +116,11 @@ class BayesianFeatureSelector(BaseEstimator, TransformerMixin):
         
         self.logger.info(f"Using device: {self.device}")
 
+        # Initialize attributes that will be loaded/saved
+        self.scaler = None
+        self.feature_names_ = None
+        self.selected_features_ = None
+
     def _log_to_mlflow(self, metrics=None, params=None, artifacts=None):
         """Helper method to handle MLflow logging with graceful fallback"""
         if not self.use_mlflow:
@@ -131,91 +140,90 @@ class BayesianFeatureSelector(BaseEstimator, TransformerMixin):
             warnings.warn(f"MLflow logging failed: {str(e)}")
 
     def fit(self, X, y):
-        # Store the scaler for later use
-        self.scaler = MinMaxScaler()
-        self.scaler.fit(X.values if isinstance(X, pd.DataFrame) else X)
-        
+        # Store feature names if X is a DataFrame
+        self.feature_names_ = X.columns if isinstance(X, pd.DataFrame) else pd.Index([f'feature_{i}' for i in range(X.shape[1])])
+
         # Shuffle input data while maintaining index alignment
-        # Extract the timestamp part of unique_id for seeding
         try:
             timestamp_str = self.unique_id.split('_')[-1]
             seed = int(timestamp_str)
         except (IndexError, ValueError):
-            # Fallback if unique_id format is unexpected
             warnings.warn(f"Warning: Could not parse timestamp from unique_id '{self.unique_id}'. Using current time for seeding.")
             seed = int(time.time())
         rng = np.random.RandomState(seed)
         shuffle_idx = rng.permutation(len(X))
-        # Ensure X and y are numpy arrays before fancy indexing if they aren't already
-        X_np = X.values if isinstance(X, pd.DataFrame) else X
-        y_np = y.values if isinstance(y, pd.Series) else y
-        
-        X_shuffled = X.iloc[shuffle_idx].reset_index(drop=True)
-        y_shuffled = y.iloc[shuffle_idx].reset_index(drop=True)
-        
-        # Convert to tensors
-        X_tensor = torch.tensor(
-            self.scaler.transform(X_shuffled) if isinstance(X, pd.DataFrame) else self.scaler.transform(X_np),
-            dtype=torch.float64,
-            device=self.device
-        )
-        y_tensor = torch.tensor(
-            y_shuffled,
-            dtype=torch.float64,
-            device=self.device
-        )
-        
-        split_idx = int(X_tensor.size(0) * (1 - self.validation_split))
-        X_train, X_val = X_tensor[:split_idx], X_tensor[split_idx:]
-        y_train, y_val = y_tensor[:split_idx], y_tensor[split_idx:]
-        
+
+        # Ensure X and y are consistently handled (DataFrames or arrays)
+        X_np = X.values if isinstance(X, pd.DataFrame) else np.asarray(X)
+        y_np = y.values if isinstance(y, pd.Series) else np.asarray(y)
+
+        X_shuffled = X_np[shuffle_idx]
+        y_shuffled = y_np[shuffle_idx]
+
+        # --- Split Data BEFORE Scaling ---
+        split_idx = int(len(X_shuffled) * (1 - self.validation_split))
+        X_train_raw, X_val_raw = X_shuffled[:split_idx], X_shuffled[split_idx:]
+        y_train_np, y_val_np = y_shuffled[:split_idx], y_shuffled[split_idx:] # Keep y as numpy for now
+
+        # --- Fit Scaler ONLY on Training Data ---
+        self.scaler = MinMaxScaler()
+        self.scaler.fit(X_train_raw)
+
+        # --- Scale Both Train and Validation Data ---
+        X_train_scaled = self.scaler.transform(X_train_raw)
+        X_val_scaled = self.scaler.transform(X_val_raw)
+
+        # Convert to tensors AFTER scaling and splitting
+        X_train = torch.tensor(X_train_scaled, dtype=torch.float64, device=self.device)
+        X_val = torch.tensor(X_val_scaled, dtype=torch.float64, device=self.device)
+        y_train = torch.tensor(y_train_np, dtype=torch.float64, device=self.device)
+        y_val = torch.tensor(y_val_np, dtype=torch.float64, device=self.device) # Now convert y_val
+
         # --- Balanced Mini-Batches Start ---
-        # Use a WeightedRandomSampler to balance the classes within each mini-batch
-        # Convert training labels to numpy for calculating class frequencies
-        labels_array = y_train.cpu().numpy().astype(int)
-        # Compute class counts (assuming binary classification: 0 and 1)
+        # Use a WeightedRandomSampler based on the training labels
+        labels_array = y_train.cpu().numpy().astype(int) # Use y_train tensor
         class_counts = np.bincount(labels_array)
-        # Compute weights: inverse frequency for each class
-        class_weights = 1. / class_counts
-        # Assign weight to each sample based on its label
+        # Handle cases where a class might be missing in the training split (unlikely but possible)
+        if len(class_counts) < 2:
+             warnings.warn("Training split contains only one class. WeightedRandomSampler might not behave as expected.")
+             # Fallback: Use standard sampling or raise error? For now, proceed but weights might be off.
+             class_weights = np.ones(2) # Dummy weights
+        else:
+             class_weights = 1. / np.maximum(class_counts, 1) # Avoid division by zero if counts are 0
+
         sample_weights = class_weights[labels_array]
-        # Create sampler: replacement=True ensures we can sample repeatedly over the smaller class.
         sampler = WeightedRandomSampler(
             weights=sample_weights,
             num_samples=len(sample_weights),
             replacement=True
         )
 
-        # Use the sampler instead of shuffle=True for balanced sampling
         train_loader = DataLoader(
-            TensorDataset(X_train, y_train),
+            TensorDataset(X_train, y_train), # Use scaled X_train tensor
             batch_size=self.batch_size,
-            sampler=sampler  # balanced mini-batches courtesy of the sampler
+            sampler=sampler
         )
         # --- Balanced Mini-Batches End ---
 
-        val_loader = DataLoader(
-            TensorDataset(X_val, y_val),
-            batch_size=self.batch_size,
-            shuffle=False
-        )
-        
-        # --- Pyro Setup ---
-        pyro.clear_param_store() # Ensure fresh start for parameters
-        num_features = X_train.shape[1]
+        # val_loader is not used, can be removed or kept commented out
+        # val_loader = DataLoader(
+        #     TensorDataset(X_val, y_val), # Use scaled X_val tensor
+        #     batch_size=self.batch_size,
+        #     shuffle=False
+        # )
 
-        def pyro_model(X, y=None): # Changed signature back, removed unused args
-            num_features = X.size(1) # Get num_features from input
+        # --- Pyro Setup ---
+        pyro.clear_param_store()
+        num_features = X_train.shape[1] # Get shape from scaled train tensor
+
+        def pyro_model(X, y=None):
+            num_features = X.size(1) # Get num_features from input tensor
 
             # --- Horseshoe Prior Definition ---
-            tau_0 = pyro.sample('tau_0', dist.HalfCauchy(scale=torch.tensor(1.0, device=self.device, dtype=torch.float64))) # Ensure scale is tensor on device
-
-            lam = pyro.sample('lam', dist.HalfCauchy(scale=torch.ones(num_features, device=self.device, dtype=torch.float64)).to_event(1)) # Use ones vector for scale
-
-            c2 = pyro.sample('c2', dist.InverseGamma(concentration=torch.ones(num_features, device=self.device, dtype=torch.float64), # Use ones vector
-                                                    rate=torch.ones(num_features, device=self.device, dtype=torch.float64)).to_event(1)) # Use ones vector
-
-            # Ensure calculations are done with tensors on the correct device
+            tau_0 = pyro.sample('tau_0', dist.HalfCauchy(scale=torch.tensor(1.0, device=self.device, dtype=torch.float64)))
+            lam = pyro.sample('lam', dist.HalfCauchy(scale=torch.ones(num_features, device=self.device, dtype=torch.float64)).to_event(1))
+            c2 = pyro.sample('c2', dist.InverseGamma(concentration=torch.ones(num_features, device=self.device, dtype=torch.float64),
+                                                    rate=torch.ones(num_features, device=self.device, dtype=torch.float64)).to_event(1))
             sigma = tau_0 * lam * torch.sqrt(c2)
 
             beta = pyro.sample(
@@ -223,16 +231,14 @@ class BayesianFeatureSelector(BaseEstimator, TransformerMixin):
                 dist.Normal(torch.zeros(num_features, dtype=torch.float64, device=self.device), sigma).to_event(1)
             )
             intercept = pyro.sample('intercept', dist.Normal(torch.tensor(0., device=self.device, dtype=torch.float64),
-                                                              torch.tensor(10., device=self.device, dtype=torch.float64))) # Back to 10.0 scale, ensure tensors
-            # --- End Horseshoe Prior Definition ---
+                                                              torch.tensor(10., device=self.device, dtype=torch.float64)))
 
-            logits = intercept + X @ beta # Matrix multiplication for logits
+            logits = intercept + X @ beta
 
             with pyro.plate('data', X.size(0)):
                 pyro.sample('obs', dist.Bernoulli(logits=logits), obs=y)
 
-
-        guide = AutoDiagonalNormal(pyro_model)
+        guide = AutoNormal(pyro_model)
 
         # --- SVI Training Loop ---
         optimizer = ClippedAdam({"lr": self.lr, "clip_norm": 10.0}) # Pyro optimizer
@@ -249,6 +255,8 @@ class BayesianFeatureSelector(BaseEstimator, TransformerMixin):
             mlflow.start_run(run_name=f"BFS_{self.unique_id}")
             # Log hyperparameters
             params_to_log = {k: v for k, v in self.__dict__.items() if isinstance(v, (int, float, str, bool)) and k != 'unique_id' and k!= 'logger'} # Exclude logger
+            # Add save_dir to logged params
+            params_to_log['save_dir'] = self.save_dir
             mlflow.log_params(params_to_log)
 
         start_time = time.time()
@@ -279,8 +287,8 @@ class BayesianFeatureSelector(BaseEstimator, TransformerMixin):
                  predictive = Predictive(pyro_model, guide=guide, num_samples=100, return_sites=("obs",)) # Get 100 posterior samples for 'obs' # Pass restored model name
 
                  with torch.no_grad():
-                      # Pass the existing validation tensor X_val
-                      posterior_samples = predictive(X_val) # Removed reg_lambda and sensitivity args
+                      # Pass the correctly scaled validation tensor X_val
+                      posterior_samples = predictive(X_val) # Use the pre-split, pre-scaled X_val
                       # posterior_samples['obs'] shape: (num_samples, num_data)
                       # Average probabilities over samples
                       # Use the posterior samples from predictive which are based on logits
@@ -292,8 +300,8 @@ class BayesianFeatureSelector(BaseEstimator, TransformerMixin):
                       y_pred_proba_val = posterior_samples['obs'].float().mean(0).cpu().numpy() # Average samples to get proba
 
                       y_pred_val = (y_pred_proba_val > 0.5).astype(int)
-                      # Use the existing validation tensor y_val
-                      y_true_val = y_val.cpu().numpy() # Use original validation labels
+                      # Use the correctly split validation tensor y_val
+                      y_true_val = y_val.cpu().numpy() # Use the pre-split y_val
 
                       # Calculate metrics using sklearn
                       accuracy = accuracy_score(y_true_val, y_pred_val)
@@ -341,7 +349,19 @@ class BayesianFeatureSelector(BaseEstimator, TransformerMixin):
                       self._best_y_pred = y_pred_val
                       self._best_y_proba = y_pred_proba_val
                       # Save parameters using Pyro's param store
-                      pyro.get_param_store().save(self.checkpoint_path)
+                      # pyro.get_param_store().save(self.checkpoint_path) # Old saving
+                      # --- Save model state to directory ---
+                      pyro_params_path = os.path.join(self.save_dir, "pyro_params.pt")
+                      scaler_path = os.path.join(self.save_dir, "scaler.joblib")
+                      feature_names_path = os.path.join(self.save_dir, "feature_names.json")
+
+                      pyro.get_param_store().save(pyro_params_path)
+                      joblib.dump(self.scaler, scaler_path)
+                      # Convert pd.Index to list for JSON serialization
+                      feature_names_list = self.feature_names_.tolist()
+                      with open(feature_names_path, 'w') as f:
+                          json.dump(feature_names_list, f)
+                      # --- End save ---
                  else:
                       patience_counter += 1
                       if patience_counter >= self.patience:
@@ -350,20 +370,6 @@ class BayesianFeatureSelector(BaseEstimator, TransformerMixin):
                            if self.use_mlflow and MLFLOW_AVAILABLE:
                                 mlflow.set_tag("early_stopping", "True")
                            break # Exit training loop
-
-
-        # --- Feature Selection Post-Training ---
-        # Load the best parameters found during training
-        try:
-            # pyro.get_param_store().load(self.checkpoint_path) # Original call causing UnpicklingError
-            with open(self.checkpoint_path, "rb") as f:
-                 # Explicitly set weights_only=False if needed by your Pyro/Torch version
-                 loaded_state = torch.load(f, map_location=self.device) # Removed weights_only=False for now, add back if needed
-            pyro.get_param_store().set_state(loaded_state)
-        except FileNotFoundError:
-             warnings.warn(f"Checkpoint file {self.checkpoint_path} not found. Using parameters from the last iteration.")
-        except Exception as e:
-             warnings.warn(f"Failed to load checkpoint {self.checkpoint_path}: {e}. Using parameters from the last iteration.")
 
         # Create DataFrame with best sample-wise validation results if available
         if self._best_y_true is not None:
@@ -377,98 +383,131 @@ class BayesianFeatureSelector(BaseEstimator, TransformerMixin):
             del self._best_y_true, self._best_y_pred, self._best_y_proba
         else:
             warnings.warn("Could not create best_validation_sample_details_ as no best validation state was recorded.")
+            self.best_validation_sample_details_ = None # Explicitly set to None
 
-        # Get posterior samples for beta coefficients using the final/best guide
-        predictive = Predictive(pyro_model, guide=guide, num_samples=self.num_samples, return_sites=['beta']) # Pass restored model name
-        # Need to pass dummy data that matches expected input shape for Predictive
-        X_dummy_for_predictive = torch.zeros((1, num_features), dtype=torch.float64, device=self.device) # Shape (1, num_features)
-        posterior_samples = predictive(X_dummy_for_predictive) # Removed reg_lambda and sensitivity args # Pass args model expects
-        beta_samples = posterior_samples['beta'].detach().cpu().numpy() # Shape: (num_samples, 1, num_features) or (num_samples, num_features)
 
-        # Squeeze dimensions if necessary, typical shape is (num_samples, num_features)
-        if beta_samples.ndim == 3:
-            beta_samples = beta_samples.squeeze(1) # This might need adjustment based on Horseshoe output shape
-
-        # --- Tail-based Feature Selection ---
-        self.logger.info("Detecting data-driven threshold for feature selection.")
+        # --- Feature Selection Post-Training ---
+        # Load the best parameters found during training
         try:
-            # Compute posterior mean and standard deviation
-            posterior_mean = np.mean(beta_samples, axis=0)
-            posterior_std = np.std(beta_samples, axis=0)
-            # Handle zero standard deviation to avoid division by zero
-            posterior_std = np.where(posterior_std == 0, np.finfo(float).eps, posterior_std)
-            # Compute standardized effect sizes
-            standardized_effect_sizes = np.abs(posterior_mean / posterior_std)
+            self._load_model_state() # Use the new loading method
+            # # pyro.get_param_store().load(self.checkpoint_path) # Original call causing UnpicklingError
+            # pyro_params_path = os.path.join(self.save_dir, "pyro_params.pt")
+            # scaler_path = os.path.join(self.save_dir, "scaler.joblib")
+            # feature_names_path = os.path.join(self.save_dir, "feature_names.json")
 
-            # Get feature names (handle DataFrame or numpy array)
-            feature_names = X.columns if isinstance(X, pd.DataFrame) else pd.Index([f'feature_{i}' for i in range(num_features)])
+            # with open(pyro_params_path, "rb") as f:
+            #      # Explicitly set weights_only=False if needed by your Pyro/Torch version
+            #      loaded_state = torch.load(f, map_location=self.device) # Removed weights_only=False for now, add back if needed
+            # pyro.get_param_store().set_state(loaded_state)
 
-            selected_feature_names, threshold, fig = select_features_by_tail(
-                standardized_effect_sizes,
-                feature_names=feature_names, # Pass the pd.Index
-                max_features=self.max_features,
-                k_neighbors=self.k_neighbors,
-                smooth_window=self.smooth_window,
-                base_cumulative_density_threshold=self.base_cumulative_density_threshold,
-                base_sensitivity=self.base_sensitivity
-            )
+            # self.scaler = joblib.load(scaler_path)
+            # with open(feature_names_path, 'r') as f:
+            #     feature_names_list = json.load(f)
+            # self.feature_names_ = pd.Index(feature_names_list)
 
-            self.selected_credible_interval = threshold # Store the threshold used
-            self.selected_features_ = selected_feature_names # Store as pd.Index
-            self.tail_fig = fig
-
-            # Log the figure to MLflow
-            if self.verbose and self.use_mlflow and MLFLOW_AVAILABLE:
-                mlflow.log_figure(fig, f"standardized_effect_sizes_tail_{self.unique_id}.png")
-                plt.close(fig) # Close the figure after logging
-
-            # --- Feature Statistics ---
-            # Compute standardized effect sizes once
-            beta_mean = np.mean(beta_samples, axis=0)
-            beta_std = np.std(beta_samples, axis=0)
-            beta_std = np.where(beta_std == 0, np.finfo(float).eps, beta_std) # Avoid division by zero
-            effect_size = np.abs(beta_mean / beta_std)
-
-            # Create feature statistics DataFrame
-            feature_stats = pd.DataFrame({
-                'feature_name': feature_names, # Use the Index directly
-                'beta_mean': beta_mean,
-                'beta_std': beta_std,
-                'effect_size': effect_size,
-                # Check membership using the Index
-                'is_selected': [name in self.selected_features_ for name in feature_names]
-            })
-
-            # Sort by absolute effect size for better readability
-            self.feature_stats = feature_stats.sort_values('effect_size', ascending=False)
-
-            # Log feature stats table to MLflow as artifact (e.g., CSV)
-            if self.use_mlflow and MLFLOW_AVAILABLE:
-                 stats_filename = f"feature_stats_{self.unique_id}.csv"
-                 self.feature_stats.to_csv(stats_filename, index=False)
-                 mlflow.log_artifact(stats_filename)
-                 # Clean up local file after logging
-                 os.remove(stats_filename)
-
-                 # Log final metrics
-                 mlflow.log_metric("final_num_selected_features", len(self.selected_features_))
-                 mlflow.log_metric("final_selection_threshold", self.selected_credible_interval)
-
-
+        except FileNotFoundError:
+             warnings.warn(f"Checkpoint files not found in {self.save_dir}. Using parameters from the last iteration (if available) and model may be unusable.")
+             # If loading fails, ensure attributes are in a consistent state (e.g., None)
+             # self.scaler = None # Should be handled by _load_model_state or initial state
+             # self.feature_names_ = None
+             # pyro.clear_param_store() # Clear potentially partially loaded state? Or rely on last iter state.
         except Exception as e:
-            self.logger.error(f"Tail detection or feature stats calculation failed: {e}", exc_info=True) # Log traceback
-            # Fallback or re-raise depending on desired behavior
-            # Maybe select top N features based on mean beta as a fallback?
-            # For now, let's store empty results and log the error
-            self.selected_features_ = pd.Index([])
-            self.feature_stats = pd.DataFrame()
-            self.selected_credible_interval = None
-            if self.use_mlflow and MLFLOW_AVAILABLE:
-                 mlflow.set_tag("error", f"Feature selection failed: {e}")
+             warnings.warn(f"Failed to load checkpoint from {self.save_dir}: {e}. Using parameters from the last iteration (if available).")
+             # Similar handling as FileNotFoundError
+
+        # Ensure scaler and feature names are loaded before proceeding
+        if self.scaler is None or self.feature_names_ is None:
+             warnings.warn("Scaler or feature names could not be loaded. Feature selection and transformation might fail.")
+             # Assign empty index to prevent downstream errors if feature_names_ needed
+             if self.feature_names_ is None: self.feature_names_ = pd.Index([])
+        else:
+            # Get posterior samples for beta coefficients using the final/best guide
+            predictive = Predictive(pyro_model, guide=guide, num_samples=self.num_samples, return_sites=['beta']) # Pass restored model name
+            # Need to pass dummy data that matches expected input shape for Predictive
+            X_dummy_for_predictive = torch.zeros((1, len(self.feature_names_)), dtype=torch.float64, device=self.device) # Use loaded feature names count
+            posterior_samples = predictive(X_dummy_for_predictive) # Removed reg_lambda and sensitivity args # Pass args model expects
+            beta_samples = posterior_samples['beta'].detach().cpu().numpy() # Shape: (num_samples, 1, num_features) or (num_samples, num_features)
+
+            # Squeeze dimensions if necessary, typical shape is (num_samples, num_features)
+            if beta_samples.ndim == 3:
+                beta_samples = beta_samples.squeeze(1) # This might need adjustment based on Horseshoe output shape
+
+            # --- Tail-based Feature Selection ---
+            self.logger.info("Detecting data-driven threshold for feature selection.")
+            try:
+                # Compute posterior mean and standard deviation
+                posterior_mean = np.mean(beta_samples, axis=0)
+                posterior_std = np.std(beta_samples, axis=0)
+                # Handle zero standard deviation to avoid division by zero
+                posterior_std = np.where(posterior_std == 0, np.finfo(float).eps, posterior_std)
+                # Compute standardized effect sizes
+                standardized_effect_sizes = np.abs(posterior_mean / posterior_std)
+
+                # Use stored feature names from loaded state
+                feature_names = self.feature_names_ # Use the loaded pd.Index
+
+                selected_feature_names, threshold, fig = select_features_by_tail(
+                    standardized_effect_sizes,
+                    feature_names=feature_names,
+                    max_features=self.max_features,
+                    k_neighbors=self.k_neighbors,
+                    smooth_window=self.smooth_window,
+                    base_cumulative_density_threshold=self.base_cumulative_density_threshold,
+                    base_sensitivity=self.base_sensitivity
+                )
+
+                self.selected_credible_interval = threshold # Store the threshold used
+                self.selected_features_ = selected_feature_names # Store as pd.Index
+                self.tail_fig = fig
+
+                # Log the figure to MLflow
+                if self.verbose and self.use_mlflow and MLFLOW_AVAILABLE:
+                    mlflow.log_figure(fig, f"standardized_effect_sizes_tail_{self.unique_id}.png")
+                    plt.close(fig) # Close the figure after logging
+
+                # --- Feature Statistics ---
+                # Compute standardized effect sizes once
+                beta_mean = np.mean(beta_samples, axis=0)
+                beta_std = np.std(beta_samples, axis=0)
+                beta_std = np.where(beta_std == 0, np.finfo(float).eps, beta_std) # Avoid division by zero
+                effect_size = np.abs(beta_mean / beta_std)
+
+                # Create feature statistics DataFrame
+                feature_stats = pd.DataFrame({
+                    'feature_name': feature_names, # Use the stored Index
+                    'beta_mean': beta_mean,
+                    'beta_std': beta_std,
+                    'effect_size': effect_size,
+                    'is_selected': [name in self.selected_features_ for name in feature_names]
+                })
+
+                # Sort by absolute effect size for better readability
+                self.feature_stats = feature_stats.sort_values('effect_size', ascending=False)
+
+                # Log feature stats table to MLflow as artifact (e.g., CSV)
+                if self.use_mlflow and MLFLOW_AVAILABLE:
+                     stats_filename = f"feature_stats_{self.unique_id}.csv"
+                     self.feature_stats.to_csv(stats_filename, index=False)
+                     mlflow.log_artifact(stats_filename)
+                     # Clean up local file after logging
+                     os.remove(stats_filename)
+
+                     # Log final metrics
+                     mlflow.log_metric("final_num_selected_features", len(self.selected_features_))
+                     mlflow.log_metric("final_selection_threshold", self.selected_credible_interval)
 
 
-        # Clean up Pyro param store
-        pyro.clear_param_store()
+            except Exception as e:
+                self.logger.error(f"Tail detection or feature stats calculation failed: {e}", exc_info=True) # Log traceback
+                # Fallback or re-raise depending on desired behavior
+                # Maybe select top N features based on mean beta as a fallback?
+                # For now, let's store empty results and log the error
+                self.selected_features_ = pd.Index([])
+                self.feature_stats = pd.DataFrame()
+                self.selected_credible_interval = None
+                if self.use_mlflow and MLFLOW_AVAILABLE:
+                     mlflow.set_tag("error", f"Feature selection failed: {e}")
+
 
         # End MLflow run if enabled and active
         if self.use_mlflow and MLFLOW_AVAILABLE and mlflow.active_run():
@@ -476,13 +515,71 @@ class BayesianFeatureSelector(BaseEstimator, TransformerMixin):
 
         return self
 
+    def _load_model_state(self):
+        """Loads the pyro parameters, scaler, and feature names from the save directory."""
+        pyro_params_path = os.path.join(self.save_dir, "pyro_params.pt")
+        scaler_path = os.path.join(self.save_dir, "scaler.joblib")
+        feature_names_path = os.path.join(self.save_dir, "feature_names.json")
+
+        if not os.path.exists(pyro_params_path) or \
+           not os.path.exists(scaler_path) or \
+           not os.path.exists(feature_names_path):
+            raise FileNotFoundError(f"One or more required checkpoint files not found in {self.save_dir}")
+
+        # Load Pyro params - using load directly, assuming it works. Fallback to torch.load if needed.
+        pyro.clear_param_store() # Clear before loading
+        pyro.get_param_store().load(pyro_params_path, map_location=self.device)
+        # Alternative using torch.load if pyro.load fails:
+        # with open(pyro_params_path, "rb") as f:
+        #     loaded_state = torch.load(f, map_location=self.device) # Consider weights_only=False if needed
+        # pyro.get_param_store().set_state(loaded_state)
+
+        # Load scaler
+        self.scaler = joblib.load(scaler_path)
+
+        # Load feature names
+        with open(feature_names_path, 'r') as f:
+            feature_names_list = json.load(f)
+        self.feature_names_ = pd.Index(feature_names_list)
+
+        self.logger.info(f"Successfully loaded model state from {self.save_dir}")
+
     def transform(self, X):
-        if not hasattr(self, 'selected_features_'):
-            raise ValueError("The model has not been fitted yet.")
+        if not hasattr(self, 'selected_features_') or self.selected_features_ is None:
+             # Try loading state if not fitted or if selected_features_ is None
+             try:
+                 self._load_model_state()
+                 # We might not have run feature selection yet if loading an older model,
+                 # but selected_features_ should be present if fit completed.
+                 # Re-check after loading.
+                 if self.selected_features_ is None:
+                      # This condition might occur if loading a model state saved *before*
+                      # feature selection was run/stored. Handle appropriately.
+                      # For now, raise error or log warning.
+                      raise ValueError("Model state loaded, but selected features are not available. Was fit fully completed?")
+             except Exception as e:
+                 raise ValueError(f"Model has not been fitted or state could not be loaded: {e}")
+
+        # Ensure X has the original features before selection and scaling
         if isinstance(X, pd.DataFrame):
-            return X[self.selected_features_]
+             # Check if columns match the original feature names
+             if not self.feature_names_.equals(X.columns):
+                 # Attempt to reindex if columns are a subset or superset, or just error out
+                 try:
+                     # Ensure all original features are present before selecting
+                     X_reindexed = X.reindex(columns=self.feature_names_, fill_value=0) # Or handle missing cols appropriately
+                 except Exception as e:
+                     raise ValueError(f"Input DataFrame columns do not match original features used for training: {e}")
+             else:
+                 X_reindexed = X # Columns match
+             return X_reindexed[self.selected_features_]
         else:
-            return X[:, self.selected_features_]
+             # Assuming numpy array has the correct columns in the original order
+             if X.shape[1] != len(self.feature_names_):
+                 raise ValueError(f"Input array has {X.shape[1]} columns, but model was trained with {len(self.feature_names_)} features.")
+             # We need indices corresponding to selected_features_ within feature_names_
+             selected_indices = [self.feature_names_.get_loc(feature) for feature in self.selected_features_]
+             return X[:, selected_indices]
 
     def log_metrics(self, epoch: int, train_loss: float, val_loss: float, accuracy: float, f1: float):
         """Log metrics with proper nesting under the feature selection run."""
@@ -522,36 +619,104 @@ class BayesianFeatureSelector(BaseEstimator, TransformerMixin):
         array-like
             Probability predictions
         """
-        if not hasattr(self, 'selected_features_'):
-            raise ValueError("Model has not been fitted yet.")
-        
+        # Try to load state if scaler or feature_names are missing
+        if self.scaler is None or self.feature_names_ is None:
+            try:
+                self._load_model_state()
+            except Exception as e:
+                 raise ValueError(f"Model needs to be fitted or state loaded before prediction: {e}")
+
+        # Ensure selected_features_ is available if not using all features
+        if not use_all_features and (not hasattr(self, 'selected_features_') or self.selected_features_ is None):
+             raise ValueError("Selected features not available. Ensure fit completed or load a model where selection was performed.")
+
+        X_input = X # Keep original for potential column checks
+
         # Convert and select features if needed
+        if isinstance(X_input, pd.DataFrame):
+            # Ensure columns match feature_names_ before potential selection/scaling
+            if not self.feature_names_.equals(X_input.columns):
+                 try:
+                      X_input = X_input.reindex(columns=self.feature_names_, fill_value=0) # Ensure correct columns and order
+                 except Exception as e:
+                      raise ValueError(f"Input DataFrame columns do not match original features: {e}")
+
+            X_processed = X_input if use_all_features else X_input[self.selected_features_]
+            feature_subset_names = self.feature_names_ if use_all_features else self.selected_features_
+        else: # Assuming numpy array
+             if X_input.shape[1] != len(self.feature_names_):
+                 raise ValueError(f"Input array has {X_input.shape[1]} columns, but model expects {len(self.feature_names_)}.")
+             if use_all_features:
+                 X_processed = X_input
+                 feature_subset_names = self.feature_names_ # Not directly used, but conceptually represents the features
+             else:
+                 # Select columns based on selected_features_
+                 selected_indices = [self.feature_names_.get_loc(feature) for feature in self.selected_features_]
+                 X_processed = X_input[:, selected_indices]
+                 feature_subset_names = self.selected_features_ # Conceptually
+
+        # Scale the input (using potentially subsetted features)
+        # Important: Scaler was fit on ALL original features. We need to transform using the same features.
+        # Therefore, scaling must happen BEFORE feature selection for prediction.
         if isinstance(X, pd.DataFrame):
-            X = X if use_all_features else X[self.selected_features_]
+             if not self.feature_names_.equals(X.columns):
+                  try:
+                       X_reindexed = X.reindex(columns=self.feature_names_, fill_value=0)
+                  except Exception as e:
+                       raise ValueError(f"Input DataFrame columns mismatch for scaling: {e}")
+             else:
+                  X_reindexed = X
+             X_scaled_all_features = self.scaler.transform(X_reindexed) # Scale using all features scaler expects
+        else: # Numpy array
+             if X.shape[1] != len(self.feature_names_):
+                  raise ValueError(f"Input array column count mismatch for scaling ({X.shape[1]} vs {len(self.feature_names_)}).")
+             X_scaled_all_features = self.scaler.transform(X)
+
+        # Now select features *after* scaling if needed
+        if use_all_features:
+            X_scaled_processed = X_scaled_all_features
+            num_processed_features = len(self.feature_names_)
         else:
-            X = X if use_all_features else X[:, self.selected_features_]
-        
-        # Scale the input
-        X_scaled = self.scaler.transform(X)
-        X_tensor = torch.tensor(X_scaled, dtype=torch.float64, device=self.device)
-        
-        # Load the best model parameters manually
-        # pyro.get_param_store().load(self.checkpoint_path)
-        with open(self.checkpoint_path, "rb") as f:
-            # Explicitly set weights_only=False
-            loaded_state = torch.load(f, map_location=self.device, weights_only=False)
-        pyro.get_param_store().set_state(loaded_state)
-        
-        # Get the current parameters
-        current_params = {k: v.clone().detach() for k, v in pyro.get_param_store().items()}
-        beta = current_params['AutoNormal.locs.beta']
-        intercept = current_params['AutoNormal.locs.intercept']
-        
-        # Compute probabilities
+            selected_indices = [self.feature_names_.get_loc(feature) for feature in self.selected_features_]
+            X_scaled_processed = X_scaled_all_features[:, selected_indices]
+            num_processed_features = len(self.selected_features_)
+
+        X_tensor = torch.tensor(X_scaled_processed, dtype=torch.float64, device=self.device)
+
+        # Load the best model parameters (already handled by _load_model_state call at start)
+        # We need the guide parameters from the loaded state.
+        # Option 1: Use Predictive (more Bayesian)
+        # Requires the pyro_model definition and the guide instance.
+        # This might be complex if the guide object itself isn't easily reconstituted.
+
+        # Option 2: Use point estimate (mean of posterior) - current approach
+        # Get the current parameters from the loaded param store state
+        current_params = pyro.get_param_store() # Access the already loaded store
+        beta_locs = current_params['AutoNormal.locs.beta'] # Changed prefix to AutoNormal
+        intercept_loc = current_params['AutoNormal.locs.intercept'] # Changed prefix to AutoNormal
+
+        # Select the beta parameters corresponding to the features being used
+        if use_all_features:
+            beta_subset_locs = beta_locs
+        else:
+            # We need the indices of selected features within the *original* feature list
+            selected_indices_in_original = [self.feature_names_.get_loc(feature) for feature in self.selected_features_]
+            beta_subset_locs = beta_locs[selected_indices_in_original]
+
+        # Ensure beta_subset_locs matches the number of features in X_tensor
+        if beta_subset_locs.shape[0] != X_tensor.shape[1]:
+             raise RuntimeError(f"Mismatch between selected beta parameters ({beta_subset_locs.shape[0]}) and input tensor features ({X_tensor.shape[1]})")
+
+
+        # Compute probabilities using point estimates
         with torch.no_grad():
-            logits = intercept + torch.matmul(X_tensor, beta)
+            # Ensure shapes match: X_tensor (N, k), beta_subset_locs (k,) -> matmul result (N,)
+            logits = intercept_loc + torch.matmul(X_tensor, beta_subset_locs)
             probs = torch.sigmoid(logits)
-        
+
+        # Clean up param store? Maybe not if predict might be called multiple times.
+        # pyro.clear_param_store()
+
         return probs.cpu().numpy()
 
     def predict(self, X, use_all_features=True):
@@ -698,6 +863,8 @@ def detect_beta_tail_threshold(effect_sizes: np.ndarray,
     ax1.set_ylabel('Density')
     ax1.legend()
     
+    ax1.set_yscale('log') # Use logarithmic scale for y-axis
+
     # Plot gradient analysis
     ax2.plot(x_grid, gradient_smooth, 'b-', label='Smoothed Gradient')
     ax2.axhline(y=0, color='gray', linestyle=':')
@@ -710,6 +877,8 @@ def detect_beta_tail_threshold(effect_sizes: np.ndarray,
     ax2.set_ylabel('Gradient')
     ax2.legend()
     
+    ax2.set_yscale('symlog', linthresh=0.01) # Use symmetric log scale for y-axis
+
     plt.tight_layout()
     
     return threshold, fig

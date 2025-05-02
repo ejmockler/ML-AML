@@ -1,3 +1,6 @@
 [submodule "CODEX"]
 	path = CODEX
 	url = https://github.com/sschrod/CODEX.git
+[submodule "BioDSNN"]
+	path = BioDSNN
+	url = https://github.com/yu3jun/BioDSNN.git
