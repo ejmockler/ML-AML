@@ -74,7 +74,7 @@ def build_processed_adata(sample_id, paths, target_gene_list, sample_type,
         print(f"Error processing sample {sample_id}: {e}. Skipping this sample.")
         return None
 
-def combine_anndatas(sample_dict, target_gene_list, case_keys):
+def combine_anndatas(sample_dict, target_gene_list, case_keys, filter_cells=True):
     """
     Loads, processes, and combines multiple samples into a single AnnData object.
 
@@ -113,7 +113,7 @@ def combine_anndatas(sample_dict, target_gene_list, case_keys):
             paths=paths,
             target_gene_list=target_gene_list,
             sample_type=sample_type,
-            filter_cells=True # Set based on notebook workflow
+            filter_cells=filter_cells # Set based on notebook workflow
         )
         
         if adata is not None and adata.n_obs > 0:
