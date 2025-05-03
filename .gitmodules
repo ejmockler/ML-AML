@@ -4,3 +4,6 @@
 [submodule "BioDSNN"]
 	path = BioDSNN
 	url = https://github.com/yu3jun/BioDSNN.git
+[submodule "GEARS"]
+	path = GEARS
+	url = https://github.com/snap-stanford/GEARS.git
